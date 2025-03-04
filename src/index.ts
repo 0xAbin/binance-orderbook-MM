@@ -1,24 +1,27 @@
+import axios from 'axios';
 import WebSocket from 'ws';
 import fs from 'fs';
-import axios from 'axios';
 import { createObjectCsvWriter } from 'csv-writer';
 
 // --------------------
 // Configuration
 // --------------------
-const SYMBOL = 'btcusdt'; // Trading pair (lowercase)
-const MAX_LVL_EXPORT = 10; // Number of order book levels to export
+const SYMBOL = 'BTCUSDT'; // symbol in uppercase for REST; lowercase for WS URL below
+const symbolLower = SYMBOL.toLowerCase();
+const MAX_LVL_EXPORT = 10; // number of levels to output
 
-// Subscribe to streams: depth, markPrice, trade, and ticker (for 24h volume)
-// Note: markPrice update message includes index price and funding rate.
-const BINANCE_WS_URL = `wss://fstream.binance.com/stream?streams=${SYMBOL}@depth@100ms/${SYMBOL}@markPrice@1s/${SYMBOL}@trade/${SYMBOL}@ticker`;
+// Combined futures streams:
+// - Depth updates at 100ms
+// - Mark price updates (1s) (includes index price and funding rate)
+// - Trade updates (for trade side/price/size)
+// - Ticker updates (for 24h volume)
+const BINANCE_WS_URL = `wss://fstream.binance.com/stream?streams=${symbolLower}@depth@100ms/${symbolLower}@markPrice@1s/${symbolLower}@trade/${symbolLower}@ticker`;
 
-// REST endpoint for open interest
-const OPEN_INTEREST_URL = `https://fapi.binance.com/fapi/v1/openInterest?symbol=${SYMBOL.toUpperCase()}`;
+// REST endpoint for snapshot and open interest
+const SNAPSHOT_URL = `https://fapi.binance.com/fapi/v1/depth?symbol=${SYMBOL}&limit=1000`;
+const OPEN_INTEREST_URL = `https://fapi.binance.com/fapi/v1/openInterest?symbol=${SYMBOL}`;
 
-// --------------------
-// CSV Setup
-// --------------------
+// CSV file configuration
 const csvFilePath = 'binance_perp_orderbook.csv';
 const headers = [
   'Last Update',
@@ -50,60 +53,180 @@ if (!fs.existsSync(csvFilePath) || fs.statSync(csvFilePath).size === 0) {
 }
 
 // --------------------
-// TypeScript Interfaces
+// Interfaces
 // --------------------
+interface OrderBookSnapshot {
+  lastUpdateId: number;
+  bids: [string, string][];
+  asks: [string, string][];
+}
+
 interface DepthUpdate {
-  E: number;        // Event time
-  s: string;        // Symbol
-  b: [string, string][]; // Bids [price, quantity]
-  a: [string, string][]; // Asks [price, quantity]
+  e: string; // event type ("depthUpdate")
+  E: number; // event time
+  s: string; // symbol
+  U: number; // first update ID in event
+  u: number; // final update ID in event
+  b: [string, string][]; // bids: [price, quantity]
+  a: [string, string][]; // asks: [price, quantity]
 }
 
 interface MarkPriceUpdate {
-  e: string;  // Event type
-  E: number;  // Event time
-  s: string;  // Symbol
-  p: string;  // Mark price
-  i: string;  // Index price
-  r: string;  // Funding rate
-  T: number;  // Next funding time
+  e: string; // event type
+  E: number; // event time
+  s: string; // symbol
+  p: string; // mark price
+  i: string; // index price
+  r: string; // funding rate
+  T: number; // next funding time
 }
 
 interface TradeUpdate {
-  e: string; // Event type
-  E: number; // Event time
-  s: string; // Symbol
-  t: number; // Trade ID
-  p: string; // Price
-  q: string; // Quantity
-  b: number; // Buyer order ID
-  a: number; // Seller order ID
-  m: boolean; // If true, buyer is the market maker (indicates sell)
+  e: string; // event type
+  E: number; // event time
+  s: string; // symbol
+  t: number; // trade ID
+  p: string; // trade price
+  q: string; // trade quantity
+  b: number; // buyer order ID
+  a: number; // seller order ID
+  m: boolean; // if true, buyer is market maker (indicates sell)
 }
 
 interface TickerUpdate {
-  e: string; // Event type
-  E: number; // Event time
-  s: string; // Symbol
-  v: string; // 24h volume (base asset)
+  e: string; // event type
+  E: number; // event time
+  s: string; // symbol
+  v: string; // 24h volume of base asset
 }
 
 // --------------------
-// Global Variables for Data
+// Global Variables
 // --------------------
+let lastUpdateId = 0;
+let orderBook = {
+  bids: new Map<number, number>(), // price -> quantity
+  asks: new Map<number, number>()
+};
+let depthUpdatesBuffer: DepthUpdate[] = []; // buffer updates if snapshot not ready
+
+// Global market data from WS
 let markPrice = '';
 let indexPrice = '';
 let fundingRate = '';
-let tradeSide = '';  // "Buy (Bid)" or "Sell (Ask)"
+let tradeSide = ''; // "Buy (Bid)" or "Sell (Ask)"
 let tradePrice = '';
 let tradeSize = '';
 let tickerVolume24h = '';
 let openInterest = '';
 
 // --------------------
-// REST Polling for Open Interest
+// Functions
 // --------------------
-const pollOpenInterest = async () => {
+
+// Get initial order book snapshot via REST
+async function getOrderBookSnapshot(): Promise<OrderBookSnapshot> {
+  const response = await axios.get<OrderBookSnapshot>(SNAPSHOT_URL);
+  return response.data;
+}
+
+// Initialize local order book from snapshot
+async function initOrderBook(): Promise<void> {
+  const snapshot = await getOrderBookSnapshot();
+  lastUpdateId = snapshot.lastUpdateId;
+  snapshot.bids.forEach(bid => {
+    orderBook.bids.set(parseFloat(bid[0]), parseFloat(bid[1]));
+  });
+  snapshot.asks.forEach(ask => {
+    orderBook.asks.set(parseFloat(ask[0]), parseFloat(ask[1]));
+  });
+  console.log(`Snapshot loaded with lastUpdateId: ${lastUpdateId}`);
+}
+
+// Process a depth update
+function processDepthUpdate(update: DepthUpdate): void {
+  // Binance recommends ignoring any update where u <= lastUpdateId.
+  if (update.u <= lastUpdateId) return;
+
+  // Only process update if update.U <= lastUpdateId+1 <= update.u
+  if (update.U <= lastUpdateId + 1 && update.u >= lastUpdateId + 1) {
+    update.b.forEach(([priceStr, qtyStr]) => {
+      const price = parseFloat(priceStr);
+      const qty = parseFloat(qtyStr);
+      if (qty === 0) {
+        orderBook.bids.delete(price);
+      } else {
+        orderBook.bids.set(price, qty);
+      }
+    });
+    update.a.forEach(([priceStr, qtyStr]) => {
+      const price = parseFloat(priceStr);
+      const qty = parseFloat(qtyStr);
+      if (qty === 0) {
+        orderBook.asks.delete(price);
+      } else {
+        orderBook.asks.set(price, qty);
+      }
+    });
+    lastUpdateId = update.u;
+  }
+}
+
+// Build a CSV row from current order book and market data
+function buildCsvRow(timestamp: number): Record<string, string> {
+  // Get sorted asks (ascending by price) and bids (descending by price)
+  const asksArr = Array.from(orderBook.asks.entries()).sort((a, b) => a[0] - b[0]).slice(0, MAX_LVL_EXPORT);
+  const bidsArr = Array.from(orderBook.bids.entries()).sort((a, b) => b[0] - a[0]).slice(0, MAX_LVL_EXPORT);
+
+  let askCumulative = 0;
+  let bidCumulative = 0;
+  const row: Record<string, string> = {
+    'Last Update': new Date(timestamp).toLocaleString(),
+    'Coin': SYMBOL,
+  };
+
+  asksArr.forEach((ask, i) => {
+    const [price, qty] = ask;
+    askCumulative += qty;
+    row[`Ask L${i + 1} Price`] = price.toFixed(2);
+    row[`Ask L${i + 1} Size`] = qty.toFixed(4);
+    row[`Ask L${i + 1} Cumulative BTC`] = askCumulative.toFixed(4);
+  });
+  // If less than MAX_LVL_EXPORT, fill remaining with empty strings
+  for (let i = asksArr.length; i < MAX_LVL_EXPORT; i++) {
+    row[`Ask L${i + 1} Price`] = '';
+    row[`Ask L${i + 1} Size`] = '';
+    row[`Ask L${i + 1} Cumulative BTC`] = '';
+  }
+
+  bidsArr.forEach((bid, i) => {
+    const [price, qty] = bid;
+    bidCumulative += qty;
+    row[`Bid L${i + 1} Price`] = price.toFixed(2);
+    row[`Bid L${i + 1} Size`] = qty.toFixed(4);
+    row[`Bid L${i + 1} Cumulative BTC`] = bidCumulative.toFixed(4);
+  });
+  for (let i = bidsArr.length; i < MAX_LVL_EXPORT; i++) {
+    row[`Bid L${i + 1} Price`] = '';
+    row[`Bid L${i + 1} Size`] = '';
+    row[`Bid L${i + 1} Cumulative BTC`] = '';
+  }
+
+  // Append global market data
+  row['Mark Price'] = markPrice || 'N/A';
+  row['Index Price'] = indexPrice || 'N/A';
+  row['Funding Rate'] = fundingRate || 'N/A';
+  row['Open Interest'] = openInterest || 'N/A';
+  row['24h Volume'] = tickerVolume24h || 'N/A';
+  row['Trade Side'] = tradeSide || '';
+  row['Trade Price'] = tradePrice || '';
+  row['Trade Size'] = tradeSize || '';
+
+  return row;
+}
+
+// Poll open interest via REST every 30 seconds
+async function pollOpenInterest(): Promise<void> {
   try {
     const response = await axios.get(OPEN_INTEREST_URL);
     openInterest = response.data.openInterest;
@@ -111,135 +234,82 @@ const pollOpenInterest = async () => {
   } catch (error) {
     console.error('🚨 Error fetching open interest:', error);
   }
-};
+}
 setInterval(pollOpenInterest, 30000);
 pollOpenInterest();
 
 // --------------------
-// WebSocket Connection
+// WebSocket Connection and Sync
 // --------------------
-const startWebSocket = () => {
+async function start() {
+  // 1. Initialize local order book snapshot
+  await initOrderBook();
+  // Process any buffered updates
+  depthUpdatesBuffer.forEach(update => processDepthUpdate(update));
+  depthUpdatesBuffer = [];
+  console.log('Local order book initialized.');
+
+  // 2. Open WebSocket connection for combined streams
   const ws = new WebSocket(BINANCE_WS_URL);
 
   ws.on('open', () => {
-    console.log('✅ Binance Perp WebSocket connected.');
+    console.log('✅ Binance Futures WebSocket connected.');
   });
 
   ws.on('message', async (data: WebSocket.Data) => {
     try {
       const parsedData = JSON.parse(data.toString());
       const { stream, data: eventData } = parsedData;
-      console.log(`📡 Received stream: ${stream}`);
 
-      // --------------------
-      // Depth Updates (Order Book Data)
-      // --------------------
-      if (stream.endsWith('@depth@100ms')) {
-        const { E, s, b, a } = eventData as DepthUpdate;
-        if (!a.length || !b.length) {
-          console.warn('⚠️ Order book data missing! Skipping write.');
-          return;
+      // Process depth updates
+      if (stream && stream.endsWith('@depth@100ms')) {
+        const depthUpdate = eventData as DepthUpdate;
+        if (lastUpdateId === 0) {
+          // Buffer updates until snapshot is loaded
+          depthUpdatesBuffer.push(depthUpdate);
+        } else {
+          processDepthUpdate(depthUpdate);
+          // After processing, build a CSV row using current timestamp
+          const row = buildCsvRow(depthUpdate.E);
+          console.log('✅ Writing CSV row:', row);
+          await csvWriter.writeRecords([row]);
         }
-        // Sort asks ascending by price
-        const sortedAsks = a.slice(0, MAX_LVL_EXPORT).sort(
-          (x, y) => parseFloat(x[0]) - parseFloat(y[0])
-        );
-        // Sort bids descending by price
-        const sortedBids = b.slice(0, MAX_LVL_EXPORT).sort(
-          (x, y) => parseFloat(y[0]) - parseFloat(x[0])
-        );
-
-        let askSum = 0;
-        let bidSum = 0;
-
-        const orderBookEntry: Record<string, any> = {
-          'Last Update': new Date(E).toLocaleString(),
-          Coin: s,
-          ...Object.fromEntries(
-            sortedAsks.flatMap((ask, i) => {
-              askSum += parseFloat(ask[1]);
-              return [
-                [`Ask L${i + 1} Price`, ask[0]],
-                [`Ask L${i + 1} Size`, ask[1]],
-                [`Ask L${i + 1} Cumulative BTC`, askSum.toFixed(4)],
-              ];
-            })
-          ),
-          ...Object.fromEntries(
-            sortedBids.flatMap((bid, i) => {
-              bidSum += parseFloat(bid[1]);
-              return [
-                [`Bid L${i + 1} Price`, bid[0]],
-                [`Bid L${i + 1} Size`, bid[1]],
-                [`Bid L${i + 1} Cumulative BTC`, bidSum.toFixed(4)],
-              ];
-            })
-          ),
-          'Mark Price': markPrice || 'N/A',
-          'Index Price': indexPrice || 'N/A',
-          'Funding Rate': fundingRate || 'N/A',
-          'Open Interest': openInterest || 'N/A',
-          '24h Volume': tickerVolume24h || 'N/A',
-          'Trade Side': tradeSide || '',
-          'Trade Price': tradePrice || '',
-          'Trade Size': tradeSize || '',
-        };
-
-        // Ensure all headers exist
-        headers.forEach(header => {
-          if (!(header in orderBookEntry)) {
-            orderBookEntry[header] = '';
-          }
-        });
-
-        console.log('✅ Writing order book entry to CSV:', orderBookEntry);
-        await csvWriter.writeRecords([orderBookEntry]);
       }
-
-      // --------------------
-      // Mark Price Updates (includes index price & funding rate)
-      // --------------------
-      if (stream.endsWith('@markPrice@1s')) {
-        const { p, i, r } = eventData as MarkPriceUpdate;
-        markPrice = p;
-        indexPrice = i;
-        fundingRate = r;
+      // Process markPrice updates (includes index price & funding rate)
+      if (stream && stream.endsWith('@markPrice@1s')) {
+        const mpUpdate = eventData as MarkPriceUpdate;
+        markPrice = mpUpdate.p;
+        indexPrice = mpUpdate.i;
+        fundingRate = mpUpdate.r;
         console.log(`📈 Mark Price: ${markPrice}, Index Price: ${indexPrice}, Funding Rate: ${fundingRate}`);
       }
-
-      // --------------------
-      // Trade Updates (for Trade Side, Trade Price, Trade Size)
-      // --------------------
-      if (stream.endsWith('@trade')) {
-        const { p, q, m } = eventData as TradeUpdate;
-        tradePrice = p;
-        tradeSize = q;
-        tradeSide = m ? 'Sell (Ask)' : 'Buy (Bid)';
-        console.log(`💰 Trade - Side: ${tradeSide}, Price: ${tradePrice}, Size: ${tradeSize}`);
+      // Process trade updates
+      if (stream && stream.endsWith('@trade')) {
+        const tradeUpdate = eventData as TradeUpdate;
+        tradePrice = tradeUpdate.p;
+        tradeSize = tradeUpdate.q;
+        tradeSide = tradeUpdate.m ? 'Sell (Ask)' : 'Buy (Bid)';
+        console.log(`💰 Trade: Side: ${tradeSide}, Price: ${tradePrice}, Size: ${tradeSize}`);
       }
-
-      // --------------------
-      // Ticker Updates (for 24h Volume)
-      // --------------------
-      if (stream.endsWith('@ticker')) {
-        const { v } = eventData as TickerUpdate;
-        tickerVolume24h = v;
+      // Process ticker updates (24h volume)
+      if (stream && stream.endsWith('@ticker')) {
+        const tickerUpdate = eventData as TickerUpdate;
+        tickerVolume24h = tickerUpdate.v;
         console.log(`📉 24h Volume: ${tickerVolume24h}`);
       }
     } catch (err) {
-      console.error('🚨 Failed to parse WebSocket message:', err);
+      console.error('🚨 Error processing WebSocket message:', err);
     }
   });
 
-  ws.on('error', (error) => {
-    console.error('❌ WebSocket error:', error);
+  ws.on('error', (err) => {
+    console.error('❌ WebSocket error:', err);
   });
 
   ws.on('close', () => {
-    console.log('⚠️ WebSocket connection closed. Reconnecting in 5 seconds...');
-    setTimeout(startWebSocket, 5000);
+    console.log('⚠️ WebSocket closed. Reconnecting in 5 seconds...');
+    setTimeout(start, 5000);
   });
-};
+}
 
-// Start the WebSocket connection
-startWebSocket();
+start();
