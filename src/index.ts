@@ -6,11 +6,11 @@ import { createObjectCsvWriter } from 'csv-writer';
 // --------------------
 // Configuration
 // --------------------
-const SYMBOL = 'btcusdt'; // trading pair (lowercase)
-const MAX_LVL_EXPORT = 10; // number of order book levels to export
+const SYMBOL = 'btcusdt'; // Trading pair (lowercase)
+const MAX_LVL_EXPORT = 10; // Number of order book levels to export
 
-// Subscribe to streams: depth, markPrice, trade, and ticker (24h volume)
-// Note: markPrice update includes index price ("i") and funding rate ("r")
+// Subscribe to streams: depth, markPrice, trade, and ticker (for 24h volume)
+// Note: markPrice update message includes index price and funding rate.
 const BINANCE_WS_URL = `wss://fstream.binance.com/stream?streams=${SYMBOL}@depth@100ms/${SYMBOL}@markPrice@1s/${SYMBOL}@trade/${SYMBOL}@ticker`;
 
 // REST endpoint for open interest
@@ -45,7 +45,6 @@ const csvWriter = createObjectCsvWriter({
   append: fs.existsSync(csvFilePath) && fs.statSync(csvFilePath).size > 0,
 });
 
-// Write header row if file is new
 if (!fs.existsSync(csvFilePath) || fs.statSync(csvFilePath).size === 0) {
   fs.writeFileSync(csvFilePath, headers.join(',') + '\n');
 }
@@ -56,8 +55,8 @@ if (!fs.existsSync(csvFilePath) || fs.statSync(csvFilePath).size === 0) {
 interface DepthUpdate {
   E: number;        // Event time
   s: string;        // Symbol
-  b: [string, string][]; // Bids: [price, quantity]
-  a: [string, string][]; // Asks: [price, quantity]
+  b: [string, string][]; // Bids [price, quantity]
+  a: [string, string][]; // Asks [price, quantity]
 }
 
 interface MarkPriceUpdate {
@@ -79,14 +78,14 @@ interface TradeUpdate {
   q: string; // Quantity
   b: number; // Buyer order ID
   a: number; // Seller order ID
-  m: boolean; // Is buyer the market maker? (true means sell, false means buy)
+  m: boolean; // If true, buyer is the market maker (indicates sell)
 }
 
 interface TickerUpdate {
   e: string; // Event type
   E: number; // Event time
   s: string; // Symbol
-  v: string; // 24h volume of base asset
+  v: string; // 24h volume (base asset)
 }
 
 // --------------------
@@ -107,7 +106,6 @@ let openInterest = '';
 const pollOpenInterest = async () => {
   try {
     const response = await axios.get(OPEN_INTEREST_URL);
-    // Response example: { openInterest: "12345.6789", symbol: "BTCUSDT" }
     openInterest = response.data.openInterest;
     console.log(`📊 Open Interest: ${openInterest}`);
   } catch (error) {
@@ -133,20 +131,32 @@ const startWebSocket = () => {
       const { stream, data: eventData } = parsedData;
       console.log(`📡 Received stream: ${stream}`);
 
-      // 1. Depth Updates (Order Book Data)
+      // --------------------
+      // Depth Updates (Order Book Data)
+      // --------------------
       if (stream.endsWith('@depth@100ms')) {
         const { E, s, b, a } = eventData as DepthUpdate;
         if (!a.length || !b.length) {
           console.warn('⚠️ Order book data missing! Skipping write.');
           return;
         }
+        // Sort asks ascending by price
+        const sortedAsks = a.slice(0, MAX_LVL_EXPORT).sort(
+          (x, y) => parseFloat(x[0]) - parseFloat(y[0])
+        );
+        // Sort bids descending by price
+        const sortedBids = b.slice(0, MAX_LVL_EXPORT).sort(
+          (x, y) => parseFloat(y[0]) - parseFloat(x[0])
+        );
+
         let askSum = 0;
         let bidSum = 0;
+
         const orderBookEntry: Record<string, any> = {
           'Last Update': new Date(E).toLocaleString(),
           Coin: s,
           ...Object.fromEntries(
-            a.slice(0, MAX_LVL_EXPORT).flatMap((ask, i) => {
+            sortedAsks.flatMap((ask, i) => {
               askSum += parseFloat(ask[1]);
               return [
                 [`Ask L${i + 1} Price`, ask[0]],
@@ -156,7 +166,7 @@ const startWebSocket = () => {
             })
           ),
           ...Object.fromEntries(
-            b.slice(0, MAX_LVL_EXPORT).flatMap((bid, i) => {
+            sortedBids.flatMap((bid, i) => {
               bidSum += parseFloat(bid[1]);
               return [
                 [`Bid L${i + 1} Price`, bid[0]],
@@ -175,7 +185,7 @@ const startWebSocket = () => {
           'Trade Size': tradeSize || '',
         };
 
-        // Ensure all headers exist in the entry
+        // Ensure all headers exist
         headers.forEach(header => {
           if (!(header in orderBookEntry)) {
             orderBookEntry[header] = '';
@@ -186,9 +196,10 @@ const startWebSocket = () => {
         await csvWriter.writeRecords([orderBookEntry]);
       }
 
-      // 2. Mark Price Updates (Also includes index price & funding rate)
+      // --------------------
+      // Mark Price Updates (includes index price & funding rate)
+      // --------------------
       if (stream.endsWith('@markPrice@1s')) {
-        // Note: The markPrice update message contains both mark price ("p") and index price ("i")
         const { p, i, r } = eventData as MarkPriceUpdate;
         markPrice = p;
         indexPrice = i;
@@ -196,17 +207,20 @@ const startWebSocket = () => {
         console.log(`📈 Mark Price: ${markPrice}, Index Price: ${indexPrice}, Funding Rate: ${fundingRate}`);
       }
 
-      // 3. Trade Updates
+      // --------------------
+      // Trade Updates (for Trade Side, Trade Price, Trade Size)
+      // --------------------
       if (stream.endsWith('@trade')) {
         const { p, q, m } = eventData as TradeUpdate;
         tradePrice = p;
         tradeSize = q;
-        // In futures, if m is true, the buyer is the market maker → Sell order; otherwise, Buy order.
         tradeSide = m ? 'Sell (Ask)' : 'Buy (Bid)';
         console.log(`💰 Trade - Side: ${tradeSide}, Price: ${tradePrice}, Size: ${tradeSize}`);
       }
 
-      // 4. Ticker Updates (24h Volume)
+      // --------------------
+      // Ticker Updates (for 24h Volume)
+      // --------------------
       if (stream.endsWith('@ticker')) {
         const { v } = eventData as TickerUpdate;
         tickerVolume24h = v;
@@ -227,4 +241,5 @@ const startWebSocket = () => {
   });
 };
 
+// Start the WebSocket connection
 startWebSocket();
