@@ -1,153 +1,230 @@
-import WebSocket from "ws";
-import fs from "fs";
-import { createObjectCsvWriter } from "csv-writer";
+import WebSocket from 'ws';
+import fs from 'fs';
+import axios from 'axios';
+import { createObjectCsvWriter } from 'csv-writer';
 
-const csvFilePath = "binance_orderbook.csv";
-const WSS = "wss://stream.binance.com:9443/ws/btcusdt@depth@100ms";
-const TRADES_WSS = "wss://stream.binance.com:9443/ws/btcusdt@trade";
-const MAX_LVL_EXPORT = 10;
+// --------------------
+// Configuration
+// --------------------
+const SYMBOL = 'btcusdt'; // trading pair (lowercase)
+const MAX_LVL_EXPORT = 10; // number of order book levels to export
 
-// Headers for Order Book and Trade Data
+// Subscribe to streams: depth, markPrice, trade, and ticker (24h volume)
+// Note: markPrice update includes index price ("i") and funding rate ("r")
+const BINANCE_WS_URL = `wss://fstream.binance.com/stream?streams=${SYMBOL}@depth@100ms/${SYMBOL}@markPrice@1s/${SYMBOL}@trade/${SYMBOL}@ticker`;
+
+// REST endpoint for open interest
+const OPEN_INTEREST_URL = `https://fapi.binance.com/fapi/v1/openInterest?symbol=${SYMBOL.toUpperCase()}`;
+
+// --------------------
+// CSV Setup
+// --------------------
+const csvFilePath = 'binance_perp_orderbook.csv';
 const headers = [
-  "Last Update",
-  "Coin",
+  'Last Update',
+  'Coin',
   ...Array.from({ length: MAX_LVL_EXPORT }, (_, i) => `Ask L${i + 1} Price`),
   ...Array.from({ length: MAX_LVL_EXPORT }, (_, i) => `Ask L${i + 1} Size`),
   ...Array.from({ length: MAX_LVL_EXPORT }, (_, i) => `Ask L${i + 1} Cumulative BTC`),
   ...Array.from({ length: MAX_LVL_EXPORT }, (_, i) => `Bid L${i + 1} Price`),
   ...Array.from({ length: MAX_LVL_EXPORT }, (_, i) => `Bid L${i + 1} Size`),
   ...Array.from({ length: MAX_LVL_EXPORT }, (_, i) => `Bid L${i + 1} Cumulative BTC`),
-  "Mark Price",
-  "Oracle Price",
-  "Funding Rate",
-  "Open Interest",
-  "24h Volume",
-  "Trade Side",
-  "Trade Price",
-  "Trade Size",
+  'Mark Price',
+  'Index Price',
+  'Funding Rate',
+  'Open Interest',
+  '24h Volume',
+  'Trade Side',
+  'Trade Price',
+  'Trade Size',
 ];
 
 const csvWriter = createObjectCsvWriter({
   path: csvFilePath,
-  header: headers.map((title) => ({ id: title, title })),
-  append: true,
+  header: headers.map(title => ({ id: title, title })),
+  append: fs.existsSync(csvFilePath) && fs.statSync(csvFilePath).size > 0,
 });
 
-if (!fs.existsSync(csvFilePath)) {
-  fs.writeFileSync(csvFilePath, headers.join(",") + "\n");
+// Write header row if file is new
+if (!fs.existsSync(csvFilePath) || fs.statSync(csvFilePath).size === 0) {
+  fs.writeFileSync(csvFilePath, headers.join(',') + '\n');
 }
 
-const webSocketConnection = () => {
-  const ws = new WebSocket(WSS);
-  const tradeWs = new WebSocket(TRADES_WSS);
+// --------------------
+// TypeScript Interfaces
+// --------------------
+interface DepthUpdate {
+  E: number;        // Event time
+  s: string;        // Symbol
+  b: [string, string][]; // Bids: [price, quantity]
+  a: [string, string][]; // Asks: [price, quantity]
+}
 
-  ws.on("open", () => {
-    console.log("Binance Order Book WebSocket connection established.");
+interface MarkPriceUpdate {
+  e: string;  // Event type
+  E: number;  // Event time
+  s: string;  // Symbol
+  p: string;  // Mark price
+  i: string;  // Index price
+  r: string;  // Funding rate
+  T: number;  // Next funding time
+}
+
+interface TradeUpdate {
+  e: string; // Event type
+  E: number; // Event time
+  s: string; // Symbol
+  t: number; // Trade ID
+  p: string; // Price
+  q: string; // Quantity
+  b: number; // Buyer order ID
+  a: number; // Seller order ID
+  m: boolean; // Is buyer the market maker? (true means sell, false means buy)
+}
+
+interface TickerUpdate {
+  e: string; // Event type
+  E: number; // Event time
+  s: string; // Symbol
+  v: string; // 24h volume of base asset
+}
+
+// --------------------
+// Global Variables for Data
+// --------------------
+let markPrice = '';
+let indexPrice = '';
+let fundingRate = '';
+let tradeSide = '';  // "Buy (Bid)" or "Sell (Ask)"
+let tradePrice = '';
+let tradeSize = '';
+let tickerVolume24h = '';
+let openInterest = '';
+
+// --------------------
+// REST Polling for Open Interest
+// --------------------
+const pollOpenInterest = async () => {
+  try {
+    const response = await axios.get(OPEN_INTEREST_URL);
+    // Response example: { openInterest: "12345.6789", symbol: "BTCUSDT" }
+    openInterest = response.data.openInterest;
+    console.log(`📊 Open Interest: ${openInterest}`);
+  } catch (error) {
+    console.error('🚨 Error fetching open interest:', error);
+  }
+};
+setInterval(pollOpenInterest, 30000);
+pollOpenInterest();
+
+// --------------------
+// WebSocket Connection
+// --------------------
+const startWebSocket = () => {
+  const ws = new WebSocket(BINANCE_WS_URL);
+
+  ws.on('open', () => {
+    console.log('✅ Binance Perp WebSocket connected.');
   });
 
-  tradeWs.on("open", () => {
-    console.log("Binance Trade WebSocket connection established.");
-  });
-
-  ws.on("message", async (data: any) => {
+  ws.on('message', async (data: WebSocket.Data) => {
     try {
-      const parsedData = JSON.parse(data);
-      const { E, s, b, a } = parsedData; // E: Event time, s: Symbol, b: Bids, a: Asks
+      const parsedData = JSON.parse(data.toString());
+      const { stream, data: eventData } = parsedData;
+      console.log(`📡 Received stream: ${stream}`);
 
-      const asks = a.slice(0, MAX_LVL_EXPORT);
-      const bids = b.slice(0, MAX_LVL_EXPORT);
+      // 1. Depth Updates (Order Book Data)
+      if (stream.endsWith('@depth@100ms')) {
+        const { E, s, b, a } = eventData as DepthUpdate;
+        if (!a.length || !b.length) {
+          console.warn('⚠️ Order book data missing! Skipping write.');
+          return;
+        }
+        let askSum = 0;
+        let bidSum = 0;
+        const orderBookEntry: Record<string, any> = {
+          'Last Update': new Date(E).toLocaleString(),
+          Coin: s,
+          ...Object.fromEntries(
+            a.slice(0, MAX_LVL_EXPORT).flatMap((ask, i) => {
+              askSum += parseFloat(ask[1]);
+              return [
+                [`Ask L${i + 1} Price`, ask[0]],
+                [`Ask L${i + 1} Size`, ask[1]],
+                [`Ask L${i + 1} Cumulative BTC`, askSum.toFixed(4)],
+              ];
+            })
+          ),
+          ...Object.fromEntries(
+            b.slice(0, MAX_LVL_EXPORT).flatMap((bid, i) => {
+              bidSum += parseFloat(bid[1]);
+              return [
+                [`Bid L${i + 1} Price`, bid[0]],
+                [`Bid L${i + 1} Size`, bid[1]],
+                [`Bid L${i + 1} Cumulative BTC`, bidSum.toFixed(4)],
+              ];
+            })
+          ),
+          'Mark Price': markPrice || 'N/A',
+          'Index Price': indexPrice || 'N/A',
+          'Funding Rate': fundingRate || 'N/A',
+          'Open Interest': openInterest || 'N/A',
+          '24h Volume': tickerVolume24h || 'N/A',
+          'Trade Side': tradeSide || '',
+          'Trade Price': tradePrice || '',
+          'Trade Size': tradeSize || '',
+        };
 
-      let askSum = 0;
-      let bidSum = 0;
+        // Ensure all headers exist in the entry
+        headers.forEach(header => {
+          if (!(header in orderBookEntry)) {
+            orderBookEntry[header] = '';
+          }
+        });
 
-      const orderBookEntry = {
-        "Last Update": new Date(E).toLocaleString(),
-        Coin: s,
-        ...Object.fromEntries(
-          asks.flatMap((ask: any, i: number) => {
-            askSum += parseFloat(ask[1]);
-            return [
-              [`Ask L${i + 1} Price`, ask[0]],
-              [`Ask L${i + 1} Size`, ask[1]],
-              [`Ask L${i + 1} Cumulative BTC`, askSum.toFixed(4)],
-            ];
-          })
-        ),
-        ...Object.fromEntries(
-          bids.flatMap((bid: any, i: number) => {
-            bidSum += parseFloat(bid[1]);
-            return [
-              [`Bid L${i + 1} Price`, bid[0]],
-              [`Bid L${i + 1} Size`, bid[1]],
-              [`Bid L${i + 1} Cumulative BTC`, bidSum.toFixed(4)],
-            ];
-          })
-        ),
-        "Mark Price": "", 
-        "Oracle Price": "", 
-        "Funding Rate": "", 
-        "Open Interest": "", 
-        "24h Volume": "", 
-        "Trade Side": "",
-        "Trade Price": "",
-        "Trade Size": "",
-      };
+        console.log('✅ Writing order book entry to CSV:', orderBookEntry);
+        await csvWriter.writeRecords([orderBookEntry]);
+      }
 
-      await csvWriter.writeRecords([orderBookEntry]);
+      // 2. Mark Price Updates (Also includes index price & funding rate)
+      if (stream.endsWith('@markPrice@1s')) {
+        // Note: The markPrice update message contains both mark price ("p") and index price ("i")
+        const { p, i, r } = eventData as MarkPriceUpdate;
+        markPrice = p;
+        indexPrice = i;
+        fundingRate = r;
+        console.log(`📈 Mark Price: ${markPrice}, Index Price: ${indexPrice}, Funding Rate: ${fundingRate}`);
+      }
+
+      // 3. Trade Updates
+      if (stream.endsWith('@trade')) {
+        const { p, q, m } = eventData as TradeUpdate;
+        tradePrice = p;
+        tradeSize = q;
+        // In futures, if m is true, the buyer is the market maker → Sell order; otherwise, Buy order.
+        tradeSide = m ? 'Sell (Ask)' : 'Buy (Bid)';
+        console.log(`💰 Trade - Side: ${tradeSide}, Price: ${tradePrice}, Size: ${tradeSize}`);
+      }
+
+      // 4. Ticker Updates (24h Volume)
+      if (stream.endsWith('@ticker')) {
+        const { v } = eventData as TickerUpdate;
+        tickerVolume24h = v;
+        console.log(`📉 24h Volume: ${tickerVolume24h}`);
+      }
     } catch (err) {
-      console.error("Failed to parse message:", data, err);
+      console.error('🚨 Failed to parse WebSocket message:', err);
     }
   });
 
-  tradeWs.on("message", async (data: any) => {
-    try {
-      const parsedTrade = JSON.parse(data);
-      const { E, s, p, q, m } = parsedTrade; // E: Event time, s: Symbol, p: Price, q: Quantity, m: Maker (true=Sell, false=Buy)
-
-      const tradeEntry = {
-        "Last Update": new Date(E).toLocaleString(),
-        Coin: s,
-        ...Object.fromEntries(
-          Array.from({ length: MAX_LVL_EXPORT }, (_, i) => [
-            [`Ask L${i + 1} Price`, ""],
-            [`Ask L${i + 1} Size`, ""],
-            [`Ask L${i + 1} Cumulative BTC`, ""],
-            [`Bid L${i + 1} Price`, ""],
-            [`Bid L${i + 1} Size`, ""],
-            [`Bid L${i + 1} Cumulative BTC`, ""],
-          ])
-        ),
-        "Mark Price": "",
-        "Oracle Price": "",
-        "Funding Rate": "",
-        "Open Interest": "",
-        "24h Volume": "",
-        "Trade Side": m ? "Sell (Ask)" : "Buy (Bid)",
-        "Trade Price": p,
-        "Trade Size": q,
-      };
-
-      await csvWriter.writeRecords([tradeEntry]);
-    } catch (err) {
-      console.error("Failed to parse trade message:", data, err);
-    }
+  ws.on('error', (error) => {
+    console.error('❌ WebSocket error:', error);
   });
 
-  ws.on("error", (error) => {
-    console.error("WebSocket error:", error);
-  });
-
-  tradeWs.on("error", (error) => {
-    console.error("Trade WebSocket error:", error);
-  });
-
-  ws.on("close", () => {
-    console.log("Order Book WebSocket connection closed.");
-  });
-
-  tradeWs.on("close", () => {
-    console.log("Trade WebSocket connection closed.");
+  ws.on('close', () => {
+    console.log('⚠️ WebSocket connection closed. Reconnecting in 5 seconds...');
+    setTimeout(startWebSocket, 5000);
   });
 };
 
-webSocketConnection();
+startWebSocket();

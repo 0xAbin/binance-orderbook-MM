@@ -188,3 +188,29 @@ export interface WsTrade {
     user: string;
     history: Array<WsTwapHistory>;
   }
+
+
+
+
+  export interface DepthUpdate {
+    E: number; // Event time
+    s: string; // Symbol
+    b: [string, string][]; // Bids to be updated [price level, quantity]
+    a: [string, string][]; // Asks to be updated [price level, quantity]
+  }
+  
+  export interface MarkPriceUpdate {
+    e: string; // Event type
+    E: number; // Event time
+    s: string; // Symbol
+    p: string; // Mark price
+    r: string; // Funding rate
+    T: number; // Next funding time
+  }
+  
+  export interface IndexPriceUpdate {
+    e: string; // Event type
+    E: number; // Event time
+    i: string; // Pair
+    p: string; // Index price
+  }
